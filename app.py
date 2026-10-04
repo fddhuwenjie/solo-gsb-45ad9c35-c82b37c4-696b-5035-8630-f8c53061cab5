@@ -165,50 +165,60 @@ def altitude_frac_ranges(a0, a1, lo, hi):
 
 
 def overlap_frac(ranges, f_lo, f_hi):
-    """区间列表与单区间求交。"""
+    """区间列表与单区间求交；保留落在区间内的退化点（对应边界擦碰）。"""
     out = []
     for a, b in ranges:
         lo, hi = max(a, f_lo), min(b, f_hi)
-        if hi - lo > 1e-9:
-            out.append((lo, hi))
+        if hi >= lo - 1e-9:
+            out.append((lo, max(lo, hi)))
     return out
 
 
-def intersection_frac_range(geom):
-    """相交结果在航段方向投影的 f 范围（调用方预先做仿射到 0..1）。"""
-    pts = []
+def merge_contained_fracs(ranges):
+    """丢弃被其他区间完全包含的区间，避免同一冲突重复成条（保留并列区间）。"""
+    out = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][0] + 1e-9 and b <= out[-1][1] + 1e-9:
+            continue
+        out.append((a, b))
+    return out
 
-    def collect(coords):
-        pts.extend(coords)
 
+def iter_geom_components(geom):
+    """把相交结果展平为各自独立的连通部件（Multi* / GeometryCollection 递归展开）。"""
     gtype = geom.geom_type
-    if gtype == "Point":
-        pts.append((geom.x, geom.y))
-    elif gtype == "MultiPoint":
-        pts.extend([(p.x, p.y) for p in geom.geoms])
-    elif gtype == "LineString":
-        pts.extend(list(geom.coords))
-    elif gtype == "MultiLineString":
-        for line in geom.geoms:
-            pts.extend(list(line.coords))
-    elif gtype == "Polygon":
-        pts.extend(list(geom.exterior.coords))
-        for interior in geom.interiors:
-            pts.extend(list(interior.coords))
-    elif gtype == "MultiPolygon":
-        for poly in geom.geoms:
-            pts.extend(list(poly.exterior.coords))
-            for interior in poly.interiors:
-                pts.extend(list(interior.coords))
-    elif gtype == "GeometryCollection":
-        fs = []
+    if gtype in ("GeometryCollection", "MultiPolygon", "MultiLineString", "MultiPoint"):
         for sub in geom.geoms:
             if not sub.is_empty:
-                fs.append(intersection_frac_range(sub))
-        return (min(f[0] for f in fs), max(f[1] for f in fs)) if fs else None
-    if not pts:
-        return None
-    return pts
+                yield from iter_geom_components(sub)
+    else:
+        yield geom
+
+
+def component_frac_ranges(inter, seg):
+    """平面相交的每个独立部件，分别沿航段方向投影为 f 区间。
+
+    部件之间的空隙不参与合并：凹形禁飞区走廊先穿一侧、再穿另一侧时，
+    返回两个相互独立的区间。
+    """
+    x0, y0 = seg["x0"], seg["y0"]
+    ux, uy, d = seg["ux"], seg["uy"], seg["d"]
+    out = []
+    for part in iter_geom_components(inter):
+        if part.geom_type == "Point":
+            pts = [(part.x, part.y)]
+        elif part.geom_type == "Polygon":
+            pts = list(part.exterior.coords)
+        else:  # LineString / LinearRing
+            pts = list(part.coords)
+        if not pts:
+            continue
+        fs = sorted(
+            min(1.0, max(0.0, ((x - x0) * ux + (y - y0) * uy) / d))
+            for x, y in pts
+        )
+        out.append((fs[0], fs[-1]))
+    return out
 
 
 def windows_for_nfz(nfz):
@@ -341,60 +351,75 @@ def analyze(state):
             if inter.is_empty:
                 continue
 
-            # 平面相交 → 沿航段方向投影得 f 范围
-            pts = intersection_frac_range(inter)
-            if not pts:
+            # 平面相交：按连通部件分别投影，得到各自独立的 f 区间（空隙保留为空隙）
+            f_parts = component_frac_ranges(inter, seg)
+            if not f_parts:
                 continue
-            fs = sorted(
-                min(1.0, max(0.0, ((x - seg["x0"]) * seg["ux"] + (y - seg["y0"]) * seg["uy"]) / seg["d"]))
-                for x, y in pts
-            )
-            f_planar = [(fs[0], fs[-1])] if fs[-1] - fs[0] > 1e-9 else [(fs[0], fs[0])]
 
-            # ∩ 高度重叠子区间
+            # ∩ 高度重叠子区间（逐部件求交，不跨部件合并；高度层随禁飞区而定）
             alt_ranges = altitude_frac_ranges(seg["a0"], seg["a1"], nz["lo"], nz["hi"])
             spatial = []
-            for fa, fb in f_planar:
+            for fa, fb in f_parts:
                 spatial.extend(overlap_frac(alt_ranges, fa, fb))
+            spatial = merge_contained_fracs(spatial)
             if not spatial:
                 continue
 
-            # ∩ 时间窗
+            # ∩ 生效时窗：逐段求交，最终结果全部落在同一个（可能被截短的）子段上
             for f_a, f_b in spatial:
-                alt_at_enter = round(interp(seg["a0"], seg["a1"], f_a), 2)
-                alt_at_exit = round(interp(seg["a0"], seg["a1"], f_b), 2)
-                lo_t, hi_t = nz["lo"], nz["hi"]
-                alt_clip_lo = round(max(min(alt_at_enter, alt_at_exit), lo_t), 2)
-                alt_clip_hi = round(min(max(alt_at_enter, alt_at_exit), hi_t), 2)
+                spatial_instant = f_b - f_a <= 1e-9
                 for w_start, w_end in nz["windows"]:
-                    enter = t0 + (t1 - t0) * f_a if t0 is not None else None
-                    exit_t = t0 + (t1 - t0) * f_b if t0 is not None else None
-                    instant = f_b - f_a <= 1e-9
-                    if instant:
+                    if t0 is not None:
+                        enter = t0 + (t1 - t0) * f_a
+                        exit_t = t0 + (t1 - t0) * f_b
+                    else:
+                        enter = exit_t = None
+                    if spatial_instant:
                         # 瞬时擦碰：仅当该时刻落在生效窗内才算
                         if w_start and enter and enter < w_start:
                             continue
                         if w_end and enter and enter > w_end:
                             continue
                     else:
-                        if w_start and exit_t and exit_t <= w_start:
+                        # 闭区间按实际重叠判定：区间端点落在窗沿上也算命中
+                        if w_start and exit_t and exit_t < w_start:
                             continue
-                        if w_end and enter and enter >= w_end:
+                        if w_end and enter and enter > w_end:
                             continue
+                        # 时窗截短区间：进入/退出时刻收到窗沿
                         if w_start and enter and enter < w_start:
                             enter = w_start
                         if w_end and exit_t and exit_t > w_end:
                             exit_t = w_end
                     if enter and exit_t and exit_t < enter:
                         continue
-                    wx = interp(to_float(wps[k]["x"]), to_float(wps[k + 1]["x"]), f_a)
-                    wy = interp(to_float(wps[k]["y"]), to_float(wps[k + 1]["y"]), f_a)
+
+                    # 区间被时窗截短后，按实际进入/退出时刻反推最终 f，
+                    # 保证 frac / 时刻 / 见证点同属一段最终冲突
+                    ef, xf = f_a, f_b
+                    if t0 is not None and t1 is not None and t1 > t0:
+                        span = (t1 - t0)
+                        ef = min(1.0, max(0.0, (enter - t0) / span))
+                        xf = min(1.0, max(0.0, (exit_t - t0) / span))
+                    if xf < ef:
+                        xf = ef
+                    # 报告的瞬时标记以最终区间（可能被时窗夹成一点）为准
+                    instant = xf - ef <= 1e-9
+
+                    alt_at_enter = round(interp(seg["a0"], seg["a1"], ef), 2)
+                    alt_at_exit = round(interp(seg["a0"], seg["a1"], xf), 2)
+                    lo_t, hi_t = nz["lo"], nz["hi"]
+                    alt_clip_lo = round(max(min(alt_at_enter, alt_at_exit), lo_t), 2)
+                    alt_clip_hi = round(min(max(alt_at_enter, alt_at_exit), hi_t), 2)
+                    # 见证点随实际进入时刻移动（位于被截短区间的进入端中心线上）
+                    wx = interp(to_float(wps[k]["x"]), to_float(wps[k + 1]["x"]), ef)
+                    wy = interp(to_float(wps[k]["y"]), to_float(wps[k + 1]["y"]), ef)
                     entries.append({
                         "nfzId": nfz.get("id"),
                         "nfzName": nfz.get("name", f"禁飞区{idx + 1}"),
                         "segIndex": k,
-                        "enterFrac": round(f_a, 5),
-                        "exitFrac": round(f_b, 5),
+                        "enterFrac": round(ef, 5),
+                        "exitFrac": round(xf, 5),
                         "enterTime": fmt_dt(enter),
                         "exitTime": fmt_dt(exit_t),
                         "durationMinutes": round((exit_t - enter).total_seconds() / 60.0, 2)
